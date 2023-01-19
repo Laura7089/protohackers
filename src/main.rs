@@ -40,7 +40,7 @@ async fn main() {
         }
         1 => {
             event!(Level::INFO, "running challenge 1 (prime time)");
-            protohackers::problem1::PrimeTime::new()
+            protohackers::problem1::PrimeTime::default()
                 .run(args.port)
                 .await
                 .unwrap();

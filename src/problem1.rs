@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+use std::sync::Arc;
+
 use crate::prelude::*;
 
 use tokio::sync::RwLock;
@@ -19,19 +22,26 @@ mod parse {
         Ok((input, ()))
     }
 
+    fn quoted(key: &[u8]) -> impl Fn(&[u8]) -> IResult<&[u8], ()> + '_ {
+        move |input| {
+            let (input, _) = alt((
+                delimited(char('"'), tag(key), char('"')),
+                delimited(char('\''), tag(key), char('\'')),
+            ))(input)?;
+            Ok((input, ()))
+        }
+    }
+
     fn method(input: &[u8]) -> IResult<&[u8], ()> {
-        let key = tag(r#""method""#);
-        let value = tag(r#""isPrime""#);
-
-        let sep = tuple((space, keysep, space));
-
-        let (input, _) = seppair(key, sep, value)(input)?;
+        let (input, _) = seppair(quoted(b"method"), keysep, quoted(b"isPrime"))(input)?;
         Ok((input, ()))
     }
 
     fn number(input: &[u8]) -> IResult<&[u8], u32> {
-        let key = tag(r#""number""#);
-        preceded(tuple((key, keysep)), nom::character::complete::u32)(input)
+        preceded(
+            tuple((quoted(b"number"), keysep)),
+            nom::character::complete::u32,
+        )(input)
     }
 
     pub fn all(input: &[u8]) -> IResult<&[u8], u32> {
@@ -43,20 +53,6 @@ mod parse {
             tuple((space, char('}'))),
         )(input)
     }
-}
-
-#[derive(ThisError, Debug)]
-pub enum Error {
-    #[error("I/O error: {0:?}")]
-    IOError(#[from] io::Error),
-    #[error("prime logic error: {0:?}")]
-    SieveError(#[from] SieveError),
-}
-
-#[derive(ThisError, Debug)]
-pub enum SieveError {
-    #[error("{0} is not contained in this sieve of len {1}")]
-    OutOfBounds(usize, usize),
 }
 
 #[derive(Debug)]
@@ -79,9 +75,7 @@ impl PrimeSieve {
         }
         let new_limit = new_limit.clamp(Self::MIN_CAPACITY, usize::MAX);
 
-        for _ in 0..(new_limit - self.0.len()) {
-            self.0.push(true);
-        }
+        self.0.resize(new_limit, true);
 
         for mult in 2..self.0.len() {
             let mut n = mult * 2;
@@ -92,12 +86,15 @@ impl PrimeSieve {
         }
     }
 
-    fn get(&self, num: usize) -> Result<bool, SieveError> {
-        if !self.contains(num) {
-            return Err(SieveError::OutOfBounds(num, self.0.len()));
+    /// Try to get a prime from the sieve
+    ///
+    /// If the sieve doesn't contain the number yet, returns `None`.
+    fn get(&self, num: usize) -> Option<bool> {
+        if self.contains(num) {
+            Some(self.0[num - 1])
+        } else {
+            None
         }
-
-        Ok(self.0[num - 1])
     }
 }
 
@@ -106,26 +103,29 @@ pub struct PrimeTime {
     sieve: RwLock<PrimeSieve>,
 }
 
-impl PrimeTime {
-    pub fn new() -> Self {
+impl Default for PrimeTime {
+    fn default() -> Self {
         Self {
             sieve: RwLock::new(PrimeSieve::with_capacity(1000)),
         }
     }
+}
 
+impl PrimeTime {
+    #[instrument]
     fn form_resp(value: bool) -> Vec<u8> {
-        format!("{{\"method\":\"isPrime\",\"prime\":{value}}}\n").into_bytes()
+        let resp = format!(r#"{{"method":"isPrime","prime":{value}}}\n"#);
+        debug!("responding: {resp}");
+        resp.into_bytes()
     }
 }
 
-impl Server<Error> for PrimeTime {}
-
 impl Service<Vec<u8>> for PrimeTime {
-    type Error = Error;
+    type Error = io::Error;
     type Response = Vec<u8>;
-    type Future = Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send>>;
 
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.sieve.try_read() {
             Ok(_) => Poll::Ready(Ok(())),
             Err(_) => Poll::Pending,
@@ -136,31 +136,56 @@ impl Service<Vec<u8>> for PrimeTime {
         let num = if let Ok((_, n)) = parse::all(&req) {
             n as usize
         } else {
-            trace!("malformed request: {}", String::from_utf8_lossy(&req));
+            trace!(
+                "malformed request: {}",
+                if req.len() < 30 {
+                    String::from_utf8_lossy(&req)
+                } else {
+                    Cow::Borrowed("[request too long]")
+                }
+            );
             return Box::pin(async move { Ok("{}\n".to_string().into_bytes()) });
         };
+        debug!("request received for {num}");
 
-        {
-            let sieve = match self.sieve.try_read() {
-                Ok(s) => s,
-                Err(_) => todo!("yield execution"),
-            };
+        Box::pin(async move {
+            let sieve = self.sieve.read().await;
 
-            if let Ok(p) = sieve.get(num) {
-                trace!("number {num} is prime = {p}");
-                return Box::pin(async move { Ok(Self::form_resp(p)) });
+            if let Some(p) = sieve.get(num) {
+                trace!("number {num} is prime: {p}");
+                return Ok(Self::form_resp(p));
             }
+
             // otherwise fall through to expanding the sieve
-        }
+            let mut sieve = self.sieve.write().await;
 
-        let mut sieve = match self.sieve.try_write() {
-            Ok(s) => s,
-            Err(_) => todo!("yield execution"),
-        };
+            debug!("expanding prime sieve to value {num}");
+            tokio::task::spawn_blocking(move || sieve.expand(num)).await;
+            let is_prime = self.sieve.read().await.get(num).unwrap();
+            Ok(Self::form_resp(is_prime))
+        })
+    }
+}
 
-        debug!("expanding prime sieve to value {num}");
-        sieve.expand(num);
-        let is_prime = sieve.get(num).unwrap();
-        Box::pin(async move { Ok(Self::form_resp(is_prime)) })
+impl Server<io::Error> for PrimeTime {}
+
+#[cfg(test)]
+mod tests {
+    use super::PrimeTime;
+
+    #[test]
+    fn valid_resp_form() {
+        use serde_json::Value;
+
+        let resp_raw = PrimeTime::form_resp(false);
+        let resp: Value = serde_json::from_slice(&resp_raw).unwrap();
+
+        let expected = Value::Object({
+            let mut map = serde_json::Map::new();
+            map.insert("method".to_owned(), Value::String("isPrime".to_owned()));
+            map.insert("prime".to_owned(), Value::Bool(false));
+            map
+        });
+        assert_eq!(expected, resp);
     }
 }

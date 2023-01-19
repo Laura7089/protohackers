@@ -44,8 +44,9 @@ where
 
     #[instrument(skip(self))]
     async fn run(&mut self, port: u16) -> Result<(), E> {
-        info!("starting TCP listener on 0.0.0.0:{}", port);
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+        let addr = format!("0.0.0.0:{}", port);
+        info!("starting TCP listener on {addr}");
+        let listener = TcpListener::bind(addr).await?;
         loop {
             let (sock, _) = listener.accept().await?;
             self.handle_socket(sock).await?;

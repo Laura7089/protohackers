@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::prelude::*;
@@ -8,7 +7,7 @@ use tokio::sync::RwLock;
 mod parse {
     use nom::branch::alt;
     use nom::bytes::complete::tag;
-    use nom::character::complete::{char, multispace0 as space};
+    use nom::character::complete::{char, line_ending, multispace0 as space};
     use nom::sequence::{delimited, preceded, separated_pair as seppair, terminated, tuple};
     use nom::IResult;
 
@@ -50,7 +49,7 @@ mod parse {
         delimited(
             tuple((char('{'), space)),
             alt((method_number, number_method)),
-            tuple((space, char('}'))),
+            tuple((space, char('}'), line_ending)),
         )(input)
     }
 }
@@ -69,21 +68,25 @@ impl PrimeSieve {
         target - 1 < self.0.len()
     }
 
-    fn expand(&mut self, new_limit: usize) {
+    fn expand(&mut self, new_limit: usize) -> bool {
         if self.contains(new_limit) {
-            return;
+            return self.0[new_limit - 1];
         }
         let new_limit = new_limit.clamp(Self::MIN_CAPACITY, usize::MAX);
 
         self.0.resize(new_limit, true);
 
         for mult in 2..self.0.len() {
+            // TODO: we can skip quite a lot of assignments by starting
+            // higher than this
             let mut n = mult * 2;
             while n <= self.0.len() {
                 self.0[n - 1] = false;
                 n += mult;
             }
         }
+
+        self.0[new_limit - 1]
     }
 
     /// Try to get a prime from the sieve
@@ -100,13 +103,13 @@ impl PrimeSieve {
 
 #[derive(Debug)]
 pub struct PrimeTime {
-    sieve: RwLock<PrimeSieve>,
+    sieve: Arc<RwLock<PrimeSieve>>,
 }
 
 impl Default for PrimeTime {
     fn default() -> Self {
         Self {
-            sieve: RwLock::new(PrimeSieve::with_capacity(1000)),
+            sieve: Arc::new(RwLock::new(PrimeSieve::with_capacity(1000))),
         }
     }
 }
@@ -114,18 +117,19 @@ impl Default for PrimeTime {
 impl PrimeTime {
     #[instrument]
     fn form_resp(value: bool) -> Vec<u8> {
-        let resp = format!(r#"{{"method":"isPrime","prime":{value}}}\n"#);
+        let mut resp = format!(r#"{{"method":"isPrime","prime":{value}}}"#);
+        resp.push('\n');
         debug!("responding: {resp}");
         resp.into_bytes()
     }
 }
 
 impl Service<Vec<u8>> for PrimeTime {
-    type Error = io::Error;
+    type Error = Infallible;
     type Response = Vec<u8>;
-    type Future = Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Vec<u8>, Infallible>> + Send>>;
 
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
         match self.sieve.try_read() {
             Ok(_) => Poll::Ready(Ok(())),
             Err(_) => Poll::Pending,
@@ -136,38 +140,38 @@ impl Service<Vec<u8>> for PrimeTime {
         let num = if let Ok((_, n)) = parse::all(&req) {
             n as usize
         } else {
-            trace!(
-                "malformed request: {}",
-                if req.len() < 30 {
-                    String::from_utf8_lossy(&req)
-                } else {
-                    Cow::Borrowed("[request too long]")
-                }
-            );
-            return Box::pin(async move { Ok("{}\n".to_string().into_bytes()) });
+            if req.len() < 30 {
+                let prev = String::from_utf8_lossy(&req);
+                trace!("malformed request: {prev}");
+            } else {
+                trace!("malformed request, too long to display");
+            }
+            return Box::pin(async { Ok("{}\n".to_string().into_bytes()) });
         };
         debug!("request received for {num}");
 
+        let sieve_handle = Arc::clone(&self.sieve);
         Box::pin(async move {
-            let sieve = self.sieve.read().await;
+            let res = { sieve_handle.read().await.get(num) };
 
-            if let Some(p) = sieve.get(num) {
-                trace!("number {num} is prime: {p}");
-                return Ok(Self::form_resp(p));
-            }
+            let is_prime = if let Some(p) = res {
+                p
+            } else {
+                // otherwise fall through to expanding the sieve
+                let mut sieve = sieve_handle.write_owned().await;
+                debug!("expanding prime sieve to value {num}");
+                tokio::task::spawn_blocking(move || sieve.expand(num))
+                    .await
+                    .unwrap()
+            };
 
-            // otherwise fall through to expanding the sieve
-            let mut sieve = self.sieve.write().await;
-
-            debug!("expanding prime sieve to value {num}");
-            tokio::task::spawn_blocking(move || sieve.expand(num)).await;
-            let is_prime = self.sieve.read().await.get(num).unwrap();
+            trace!("number {num} is prime: {is_prime}");
             Ok(Self::form_resp(is_prime))
         })
     }
 }
 
-impl Server<io::Error> for PrimeTime {}
+impl Server for PrimeTime {}
 
 #[cfg(test)]
 mod tests {

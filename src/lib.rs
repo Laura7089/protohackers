@@ -1,5 +1,6 @@
+#![deny(clippy::pedantic)]
+
 use async_trait::async_trait;
-use std::io;
 pub mod problem0;
 pub mod problem1;
 
@@ -18,38 +19,37 @@ mod prelude {
     pub use async_trait::async_trait;
     pub use thiserror::Error as ThisError;
     pub use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    pub use tokio::net::{TcpListener, TcpStream};
     pub use tower::Service;
     pub use tracing::{debug, error, info, instrument, trace, warn};
 }
 use prelude::*;
 
+use tokio::net::TcpListener;
+use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
+
 /// A trait for quick-and-dirty server execution
 #[async_trait]
-pub trait Server<E>
+pub trait Server
 where
-    Self: Sized + std::fmt::Debug + Service<Vec<u8>, Response = Vec<u8>, Error = E>,
-    E: From<io::Error>,
+    Self: Sized + std::fmt::Debug + Service<Vec<u8>, Response = Vec<u8>>,
     <Self as Service<Vec<u8>>>::Future: Send,
+    <Self as Service<Vec<u8>>>::Error: std::fmt::Debug,
 {
-    #[instrument(skip_all)]
-    async fn handle_socket(&mut self, mut sock: TcpStream) -> Result<(), E> {
-        let mut buf = Vec::new();
-        sock.read_buf(&mut buf).await?;
-        debug!("handling request of len {}", buf.len());
-        let resp = self.call(buf).await?;
-        sock.write_all(&resp).await?;
-        Ok(())
-    }
-
     #[instrument(skip(self))]
-    async fn run(&mut self, port: u16) -> Result<(), E> {
-        let addr = format!("0.0.0.0:{}", port);
+    async fn run(&mut self, port: u16) {
+        let addr = format!("0.0.0.0:{port}");
         info!("starting TCP listener on {addr}");
-        let listener = TcpListener::bind(addr).await?;
-        loop {
-            let (sock, _) = listener.accept().await?;
-            self.handle_socket(sock).await?;
+        let mut listener = TcpListenerStream::new(
+            TcpListener::bind(addr)
+                .await
+                .expect("failed to bind address"),
+        );
+        while let Some(mut stream) = listener.next().await.transpose().unwrap() {
+            let mut buf = Vec::new();
+            stream.read_buf(&mut buf).await.unwrap();
+            debug!("handling request of len {}", buf.len());
+            let resp = self.call(buf).await.unwrap();
+            stream.write_all(&resp).await.unwrap();
         }
     }
 }

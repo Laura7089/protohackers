@@ -18,4 +18,4 @@ impl Service<Vec<u8>> for SmokeTest {
     }
 }
 
-impl crate::Server<io::Error> for SmokeTest {}
+impl Server for SmokeTest {}

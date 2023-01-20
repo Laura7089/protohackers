@@ -1,7 +1,6 @@
 use clap::Parser;
 use protohackers::Server;
 use tracing::{event, instrument, Level};
-use tracing_subscriber;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -33,17 +32,13 @@ async fn main() {
     match args.challenge {
         0 => {
             event!(Level::INFO, "running challenge 0 (smoke test)");
-            protohackers::problem0::SmokeTest
-                .run(args.port)
-                .await
-                .unwrap();
+            protohackers::problem0::SmokeTest.run(args.port).await;
         }
         1 => {
             event!(Level::INFO, "running challenge 1 (prime time)");
             protohackers::problem1::PrimeTime::default()
                 .run(args.port)
-                .await
-                .unwrap();
+                .await;
         }
         _ => panic!("Challenge number {} not known", args.challenge),
     }

@@ -3,7 +3,7 @@ use problem0::TcpEcho;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_service::Service;
-use tracing::{debug, debug_span, trace};
+use tracing::{debug, debug_span, trace, error};
 
 const LISTEN_ADDR: &str = "0.0.0.0:5000";
 
@@ -24,20 +24,30 @@ async fn main() -> std::io::Result<()> {
             debug!(parent: &span, "new connection");
 
             let mut service = TcpEcho;
-            let mut buf = vec![0u8; 1024];
 
-            loop {
-                let n = stream.read(&mut buf).await.unwrap();
-                trace!(parent: &span, "received {n} bytes");
-                if n == 0 {
-                    // socket closed
-                    debug!(parent: &span, "socket closed");
+            let mut buf = Vec::new();
+            let n = match stream.read_to_end(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    error!(parent: &span, "io error receiving data: {e}");
                     return;
                 }
+            };
+            trace!(parent: &span, "received {n} bytes");
 
-                let resp = service.call(buf[0..n].to_owned()).await.unwrap();
-                stream.write(&resp).await.unwrap();
-                trace!(parent: &span, "sent {} bytes", resp.len());
+            // unwrap because TcpEcho is infallible
+            let resp = service.call(buf).await.unwrap();
+
+            let n = match stream.write(&resp).await {
+                Ok(n) => n,
+                Err(e) => {
+                    error!(parent: &span, "io error sending response: {e}");
+                    return;
+                }
+            };
+            trace!(parent: &span, "sent {n} bytes, closing");
+            if let Err(e) = stream.shutdown().await {
+                error!(parent: &span, "io error sending response: {e}");
             }
         });
     }
